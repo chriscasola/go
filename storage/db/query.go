@@ -132,17 +132,18 @@ func (p part) merge(p2 part) (part, error) {
 }
 
 // sql returns a SQL expression and a list of arguments for finding records matching p.
-func (p part) sql() (sql string, args []interface{}, err error) {
+func (p part) sql(driverName string) (sql string, args []interface{}, err error) {
+	pg := placeholderGenerator(driverName)
 	if p.key == "upload" {
 		switch p.operator {
 		case equals:
-			return "SELECT UploadID, RecordID FROM Records WHERE UploadID = ?", []interface{}{p.value}, nil
+			return "SELECT UploadID, RecordID FROM Records WHERE UploadID = " + pg(), []interface{}{p.value}, nil
 		case lt:
-			return "SELECT UploadID, RecordID FROM Records WHERE UploadID < ?", []interface{}{p.value}, nil
+			return "SELECT UploadID, RecordID FROM Records WHERE UploadID < " + pg(), []interface{}{p.value}, nil
 		case gt:
-			return "SELECT UploadID, RecordID FROM Records WHERE UploadID > ?", []interface{}{p.value}, nil
+			return "SELECT UploadID, RecordID FROM Records WHERE UploadID > " + pg(), []interface{}{p.value}, nil
 		case ltgt:
-			return "SELECT UploadID, RecordID FROM Records WHERE UploadID < ? AND UploadID > ?", []interface{}{p.value, p.value2}, nil
+			return fmt.Sprintf("SELECT UploadID, RecordID FROM Records WHERE UploadID < %s AND UploadID > %s", pg(), pg()), []interface{}{p.value, p.value2}, nil
 		}
 	}
 	switch p.operator {
@@ -151,18 +152,31 @@ func (p part) sql() (sql string, args []interface{}, err error) {
 			// TODO(quentin): Implement support for searching for missing labels.
 			return "", nil, fmt.Errorf("missing value for key %q", p.key)
 		}
-		return "SELECT UploadID, RecordID FROM RecordLabels WHERE Name = ? AND Value = ?", []interface{}{p.key, p.value}, nil
+		return fmt.Sprintf("SELECT UploadID, RecordID FROM RecordLabels WHERE Name = %s AND Value = %s", pg(), pg()), []interface{}{p.key, p.value}, nil
 	case lt:
-		return "SELECT UploadID, RecordID FROM RecordLabels WHERE Name = ? AND Value < ?", []interface{}{p.key, p.value}, nil
+		return fmt.Sprintf("SELECT UploadID, RecordID FROM RecordLabels WHERE Name = %s AND Value < %s", pg(), pg()), []interface{}{p.key, p.value}, nil
 	case gt:
 		if p.value == "" {
 			// Simplify queries for any value.
-			return "SELECT UploadID, RecordID FROM RecordLabels WHERE Name = ?", []interface{}{p.key}, nil
+			return "SELECT UploadID, RecordID FROM RecordLabels WHERE Name = " + pg(), []interface{}{p.key}, nil
 		}
-		return "SELECT UploadID, RecordID FROM RecordLabels WHERE Name = ? AND Value > ?", []interface{}{p.key, p.value}, nil
+		return fmt.Sprintf("SELECT UploadID, RecordID FROM RecordLabels WHERE Name = %s AND Value > %s", pg(), pg()), []interface{}{p.key, p.value}, nil
 	case ltgt:
-		return "SELECT UploadID, RecordID FROM RecordLabels WHERE Name = ? AND Value < ? AND Value > ?", []interface{}{p.key, p.value, p.value2}, nil
+		return fmt.Sprintf("SELECT UploadID, RecordID FROM RecordLabels WHERE Name = %s AND Value < %s AND Value > %s", pg(), pg(), pg()), []interface{}{p.key, p.value, p.value2}, nil
 	default:
 		panic("unknown operator " + string(p.operator))
 	}
+}
+
+func placeholderGenerator(driverName string) func() string {
+	if driverName == "postgres" {
+		i := 1
+		return func() string {
+			p := fmt.Sprintf("$%d", i)
+			i++
+			return p
+		}
+	}
+
+	return func() string { return "?" }
 }

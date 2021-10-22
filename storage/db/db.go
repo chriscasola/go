@@ -78,33 +78,46 @@ var createTmpl = template.Must(template.New("create").Parse(`
 CREATE TABLE IF NOT EXISTS Uploads (
 	UploadID VARCHAR(20) PRIMARY KEY,
 	Day VARCHAR(8),
+{{if .postgres }}
+	Seq BIGINT
+{{else}}
 	Seq BIGINT UNSIGNED
-{{if not .sqlite3}}
+{{end}}
+{{if and (not .sqlite3) (not .postgres)}}
 	, Index (Day, Seq)
 {{end}}
 );
-{{if .sqlite3}}
+{{if or .sqlite3 .postgres}}
 CREATE INDEX IF NOT EXISTS UploadDaySeq ON Uploads(Day, Seq);
 {{end}}
 CREATE TABLE IF NOT EXISTS Records (
 	UploadID VARCHAR(20) NOT NULL,
+{{if .postgres }}
+	RecordID BIGINT NOT NULL,
+	Content bytea NOT NULL,
+{{else}}
 	RecordID BIGINT UNSIGNED NOT NULL,
 	Content BLOB NOT NULL,
+{{end}}
 	PRIMARY KEY (UploadID, RecordID),
 	FOREIGN KEY (UploadID) REFERENCES Uploads(UploadID) ON UPDATE CASCADE ON DELETE CASCADE
 );
 CREATE TABLE IF NOT EXISTS RecordLabels (
 	UploadID VARCHAR(20) NOT NULL,
+{{if .postgres }}
+	RecordID BIGINT NOT NULL,
+{{else}}
 	RecordID BIGINT UNSIGNED NOT NULL,
+{{end}}
 	Name VARCHAR(255) NOT NULL,
 	Value VARCHAR(8192) NOT NULL,
-{{if not .sqlite3}}
+{{if and (not .sqlite3) (not .postgres) }}
 	Index (Name(100), Value(100)),
 {{end}}
 	PRIMARY KEY (UploadID, RecordID, Name),
 	FOREIGN KEY (UploadID, RecordID) REFERENCES Records(UploadID, RecordID) ON UPDATE CASCADE ON DELETE CASCADE
 );
-{{if .sqlite3}}
+{{if or .sqlite3 .postgres}}
 CREATE INDEX IF NOT EXISTS RecordLabelsNameValue ON RecordLabels(Name, Value);
 {{end}}
 `))
@@ -139,15 +152,25 @@ func (db *DB) prepareStatements(driverName string) error {
 	if err != nil {
 		return err
 	}
-	db.insertUpload, err = db.sql.Prepare("INSERT INTO Uploads(UploadID, Day, Seq) VALUES (?, ?, ?)")
+	if driverName == "postgres" {
+		db.insertUpload, err = db.sql.Prepare("INSERT INTO Uploads(UploadID, Day, Seq) VALUES ($1, $2, $3)")
+	} else {
+		db.insertUpload, err = db.sql.Prepare("INSERT INTO Uploads(UploadID, Day, Seq) VALUES (?, ?, ?)")
+	}
 	if err != nil {
 		return err
 	}
-	db.checkUpload, err = db.sql.Prepare("SELECT 1 FROM Uploads WHERE UploadID = ?")
+
+	placeholder := "?"
+	if driverName == "postgres" {
+		placeholder = "$1"
+	}
+
+	db.checkUpload, err = db.sql.Prepare(fmt.Sprintf("SELECT 1 FROM Uploads WHERE UploadID = %s", placeholder))
 	if err != nil {
 		return err
 	}
-	db.deleteRecords, err = db.sql.Prepare("DELETE FROM Records WHERE UploadID = ?")
+	db.deleteRecords, err = db.sql.Prepare(fmt.Sprintf("DELETE FROM Records WHERE UploadID = %s", placeholder))
 	if err != nil {
 		return err
 	}
@@ -319,26 +342,43 @@ func repeatDelim(s, delim string, n int) string {
 	return strings.TrimSuffix(strings.Repeat(s+delim, n), delim)
 }
 
+func repeatPostgresPlaceholders(start, n int, delim string) string {
+	var s string
+	for i := start; i < start+n; i++ {
+		s += fmt.Sprintf("$%d%s", i, delim)
+	}
+	return strings.TrimSuffix(s, delim)
+}
+
 // insertMultiple executes a single INSERT statement to insert multiple rows.
-func insertMultiple(tx *sql.Tx, sqlPrefix string, argsPerRow int, args []interface{}) error {
+func insertMultiple(tx *sql.Tx, driverName string, sqlPrefix string, argsPerRow int, args []interface{}) error {
 	if len(args) == 0 {
 		return nil
 	}
-	query := sqlPrefix + repeatDelim("("+repeatDelim("?", ", ", argsPerRow)+")", ", ", len(args)/argsPerRow)
+	query := sqlPrefix
+	if driverName == "postgres" {
+		for i := 1; i <= len(args); i += argsPerRow {
+			query += "(" + repeatPostgresPlaceholders(i, argsPerRow, ", ") + "), "
+		}
+		query = strings.TrimSuffix(query, ", ")
+	} else {
+		query += repeatDelim("("+repeatDelim("?", ", ", argsPerRow)+")", ", ", len(args)/argsPerRow)
+	}
 	_, err := tx.Exec(query, args...)
 	return err
 }
 
 // flush sends INSERT statements for any pending data in u.insertRecordArgs and u.insertLabelArgs.
 func (u *Upload) flush() error {
+	driverName := u.db.driverName
 	if n := len(u.insertRecordArgs); n > 0 {
-		if err := insertMultiple(u.tx, "INSERT INTO Records(UploadID, RecordID, Content) VALUES ", 3, u.insertRecordArgs); err != nil {
+		if err := insertMultiple(u.tx, driverName, "INSERT INTO Records(UploadID, RecordID, Content) VALUES ", 3, u.insertRecordArgs); err != nil {
 			return err
 		}
 		u.insertRecordArgs = nil
 	}
 	if n := len(u.insertLabelArgs); n > 0 {
-		if err := insertMultiple(u.tx, "INSERT INTO RecordLabels VALUES ", 4, u.insertLabelArgs); err != nil {
+		if err := insertMultiple(u.tx, driverName, "INSERT INTO RecordLabels VALUES ", 4, u.insertLabelArgs); err != nil {
 			return err
 		}
 		u.insertLabelArgs = nil
@@ -363,7 +403,7 @@ func (u *Upload) Abort() error {
 
 // parseQuery parses a query into a slice of SQL subselects and a slice of arguments.
 // The subselects must be joined with INNER JOIN in the order returned.
-func parseQuery(q string) (sql []string, args []interface{}, err error) {
+func parseQuery(q string, driverName string) (sql []string, args []interface{}, err error) {
 	var keys []string
 	parts := make(map[string]part)
 	for _, word := range query.SplitWords(q) {
@@ -384,7 +424,7 @@ func parseQuery(q string) (sql []string, args []interface{}, err error) {
 	// Process each key
 	sort.Strings(keys)
 	for _, key := range keys {
-		s, a, err := parts[key].sql()
+		s, a, err := parts[key].sql(driverName)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -406,7 +446,7 @@ func (db *DB) Query(q string) *Query {
 
 	query := "SELECT r.Content FROM "
 
-	sql, args, err := parseQuery(q)
+	sql, args, err := parseQuery(q, db.driverName)
 	if err != nil {
 		ret.err = err
 		return ret
@@ -586,33 +626,37 @@ func (db *DB) ListUploads(q string, extraLabels []string, limit int) *UploadList
 	ret := &UploadList{q: q, extraLabels: extraLabels}
 
 	var args []interface{}
-	query := "SELECT j.UploadID, rCount"
+	query := "SELECT j.UploadID, rcount"
 	for i, label := range extraLabels {
-		query += fmt.Sprintf(", (SELECT l%d.Value FROM RecordLabels l%d WHERE l%d.UploadID = j.UploadID AND Name = ? LIMIT 1)", i, i, i)
+		placeholder := "?"
+		if db.driverName == "postgres" {
+			placeholder = fmt.Sprintf("$%d", i+1)
+		}
+		query += fmt.Sprintf(", (SELECT l%d.Value FROM RecordLabels l%d WHERE l%d.UploadID = j.UploadID AND Name = %s LIMIT 1)", i, i, i, placeholder)
 		args = append(args, label)
 	}
-	sql, qArgs, err := parseQuery(q)
+	sql, qArgs, err := parseQuery(q, db.driverName)
 	if err != nil {
 		ret.err = err
 		return ret
 	}
 	if len(sql) == 0 {
 		// Optimize empty query.
-		query += " FROM (SELECT UploadID, (SELECT COUNT(*) FROM Records r WHERE r.UploadID = u.UploadID) AS rCount FROM Uploads u "
+		query += " FROM (SELECT UploadID, (SELECT COUNT(*) FROM Records r WHERE r.UploadID = u.UploadID) AS rcount FROM Uploads u "
 		switch db.driverName {
-		case "sqlite3":
+		case "sqlite3", "postgres":
 			query += "WHERE"
 		default:
 			query += "HAVING"
 		}
-		query += " rCount > 0 ORDER BY u.Day DESC, u.Seq DESC, u.UploadID DESC"
+		query += " (SELECT COUNT(*) FROM Records r WHERE r.UploadID = u.UploadID) > 0 ORDER BY u.Day DESC, u.Seq DESC, u.UploadID DESC"
 		if limit != 0 {
 			query += fmt.Sprintf(" LIMIT %d", limit)
 		}
 		query += ") j"
 	} else {
 		// Join individual queries.
-		query += " FROM (SELECT UploadID, COUNT(*) as rCount FROM "
+		query += " FROM (SELECT UploadID, COUNT(*) as rcount FROM "
 		args = append(args, qArgs...)
 		for i, part := range sql {
 			if i > 0 {
